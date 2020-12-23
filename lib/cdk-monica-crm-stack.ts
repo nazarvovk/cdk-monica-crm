@@ -6,6 +6,7 @@ import * as ecs from '@aws-cdk/aws-ecs';
 import * as iam from '@aws-cdk/aws-iam';
 import * as ssm from '@aws-cdk/aws-ssm';
 import * as secretsmanager from '@aws-cdk/aws-secretsmanager';
+require('dotenv').config();
 
 export class CdkMonicaCrmStack extends cdk.Stack {
   constructor(scope: cdk.Construct, id: string, props?: cdk.StackProps) {
@@ -29,6 +30,7 @@ export class CdkMonicaCrmStack extends cdk.Stack {
         },
       }
     );
+
     const auroraCluster = new rds.ServerlessCluster(this, 'AuroraCluster', {
       engine: rds.DatabaseClusterEngine.AURORA,
       vpc,
@@ -40,21 +42,29 @@ export class CdkMonicaCrmStack extends cdk.Stack {
       scaling: {
         minCapacity: 1,
         maxCapacity: 1,
-        /* bug in cdk, according to the docs, this should work
-        https://docs.aws.amazon.com/cdk/api/latest/docs/@aws-cdk_aws-rds.ServerlessScalingOptions.html */
-        // @ts-ignore
         autoPause: cdk.Duration.minutes(45),
       },
     });
+    auroraCluster.connections.allowFromAnyIpv4(ec2.Port.allTcp());
 
     const ecsCluster = new ecs.Cluster(this, 'EcsCluster', {
       vpc,
     });
+
     ecsCluster.addCapacity('EcsInstance', {
       instanceType: new ec2.InstanceType('t3a.nano'),
       desiredCapacity: 1,
+      vpcSubnets: vpc.selectSubnets({
+        subnetType: ec2.SubnetType.PUBLIC,
+      }),
     });
-    const taskDefinition = new ecs.Ec2TaskDefinition(this, 'TaskDefinition');
+
+    ecsCluster.connections.allowFromAnyIpv4(ec2.Port.allTcp());
+    const taskDefinition = new ecs.Ec2TaskDefinition(
+      this,
+      'TaskDefinition',
+      {}
+    );
     taskDefinition.addVolume({
       name: 'dockersock',
       host: {
@@ -67,35 +77,36 @@ export class CdkMonicaCrmStack extends cdk.Stack {
         sourcePath: '/tmp/',
       },
     });
-    // Monica container
+
     const monicaContainer = new ecs.ContainerDefinition(
       this,
       'monicaContainer',
       {
         taskDefinition,
-        image: ecs.ContainerImage.fromRegistry('monicahq/monica'),
+        image: ecs.ContainerImage.fromRegistry('monicahq/monicahq'),
         memoryReservationMiB: 250,
+        logging: ecs.LogDriver.awsLogs({
+          streamPrefix: 'CDK-MonicaContainer',
+        }),
         environment: {
+          APP_DEBUG: 'true',
           APP_KEY: 'z9d0DCivTAzfwWq3UFralPUrkuoXZlDl',
           APP_TRUSTED_PROXIES: '*',
-          AWS_REGION: 'eu-central-1',
+          AWS_REGION: this.region,
           AWS_BUCKET: bucket.bucketName,
-          // FIXME move AWS_KEY & AWS_SECRET to secrets
-          // AWS_KEY: '<<AWS KEY TO ACCESS BUCKET>>',
           AWS_KEY: accessKey.ref,
-          // AWS_SECRET: '<<AWS SECRET TO ACCESS BUCKET>>',
           AWS_SECRET: accessKey.attrSecretAccessKey,
           AWS_SERVER: '',
           DAV_ENABLED: 'true',
-          DB_HOST: auroraCluster.clusterIdentifier,
+          DB_HOST: auroraCluster.clusterEndpoint.hostname,
           DB_USERNAME: 'admin',
           DEFAULT_FILESYSTEM: 's3',
           MAIL_ENCRYPTION: 'tls',
-          // MAIL_FROM_ADDRESS: '<<FROM EMAIL ADDRESS>>',
-          // MAIL_FROM_NAME: '<<FROM EMAIL NAME>>',
-          // MAIL_HOST: '<<SMTP HOST>>',
-          // MAIL_PASSWORD: '<<SMTP PASSWORD>>',
-          // MAIL_USERNAME: '<<SMTP USERNAME>>',
+          MAIL_FROM_ADDRESS: process.env.MAIL_FROM_ADDRESS || '',
+          MAIL_FROM_NAME: process.env.MAIL_FROM_NAME || '',
+          MAIL_HOST: process.env.MAIL_HOST || '',
+          MAIL_PASSWORD: process.env.MAIL_PASSWORD || '',
+          MAIL_USERNAME: process.env.MAIL_USERNAME || '',
           MAIL_MAILER: 'smtp',
           MAIL_PORT: '587',
           MFA_ENABLED: 'true',
@@ -107,7 +118,7 @@ export class CdkMonicaCrmStack extends cdk.Stack {
         dockerLabels: {
           'traefik.enable': 'true',
           'traefik.http.routers.app.entrypoints': 'app',
-          'traefik.http.routers.app.rule': `Host(\`${this.stackName}\`)`,
+          'traefik.http.routers.app.rule': `Host(\`${process.env.DOMAIN_NAME}\`)`,
           'traefik.http.routers.app.tls.certresolver': 'mytls',
         },
       }
@@ -120,9 +131,13 @@ export class CdkMonicaCrmStack extends cdk.Stack {
         taskDefinition,
         image: ecs.ContainerImage.fromRegistry('traefik:v2.3.0-rc2'),
         memoryReservationMiB: 200,
+        logging: ecs.LogDriver.awsLogs({
+          streamPrefix: 'CDK-TraeficContainer',
+        }),
         environment: {
           TRAEFIK_API_INSECURE: 'true',
-          TRAEFIK_CERTIFICATESRESOLVERS_MYTLS_ACME_EMAIL: 'work@nvovk.com',
+          TRAEFIK_CERTIFICATESRESOLVERS_MYTLS_ACME_EMAIL:
+            process.env.SSL_EMAIL || '',
           TRAEFIK_CERTIFICATESRESOLVERS_MYTLS_ACME_TLSCHALLENGE: 'true',
           TRAEFIK_CERTIFICATESRSOLVERS_MYTLS_ACME_STORAGE:
             '/letsencrypt/acme.json',
@@ -160,5 +175,9 @@ export class CdkMonicaCrmStack extends cdk.Stack {
         containerPort: 8080,
       }
     );
+    const service = new ecs.Ec2Service(this, 'MonicaService', {
+      cluster: ecsCluster,
+      taskDefinition,
+    });
   }
 }
