@@ -4,7 +4,6 @@ import * as ec2 from '@aws-cdk/aws-ec2';
 import * as rds from '@aws-cdk/aws-rds';
 import * as ecs from '@aws-cdk/aws-ecs';
 import * as iam from '@aws-cdk/aws-iam';
-import * as ssm from '@aws-cdk/aws-ssm';
 import * as secretsmanager from '@aws-cdk/aws-secretsmanager';
 require('dotenv').config();
 
@@ -123,58 +122,12 @@ export class CdkMonicaCrmStack extends cdk.Stack {
         },
       }
     );
-
-    const traefikContainer = new ecs.ContainerDefinition(
-      this,
-      'traeficContainer',
-      {
-        taskDefinition,
-        image: ecs.ContainerImage.fromRegistry('traefik:v2.3.0-rc2'),
-        memoryReservationMiB: 200,
-        logging: ecs.LogDriver.awsLogs({
-          streamPrefix: 'CDK-TraeficContainer',
-        }),
-        environment: {
-          TRAEFIK_API_INSECURE: 'true',
-          TRAEFIK_CERTIFICATESRESOLVERS_MYTLS_ACME_EMAIL:
-            process.env.SSL_EMAIL || '',
-          TRAEFIK_CERTIFICATESRESOLVERS_MYTLS_ACME_TLSCHALLENGE: 'true',
-          TRAEFIK_CERTIFICATESRSOLVERS_MYTLS_ACME_STORAGE:
-            '/letsencrypt/acme.json',
-          TRAEFIK_ENTRYPOINTS_APP_ADDRESS: ':443',
-          TRAEFIK_PROVIDERS_DOCKER: 'true',
-          TRAEFIK_PROVIDERS_DOCKER_EXPOSEDBYDEFAULT: 'false',
-        },
-      }
-    );
-    traefikContainer.addContainerDependencies({
-      container: monicaContainer,
-      condition: ecs.ContainerDependencyCondition.START,
+    monicaContainer.addPortMappings({
+      hostPort: 80,
+      protocol: ecs.Protocol.TCP,
+      containerPort: 80,
     });
-    traefikContainer.addMountPoints(
-      {
-        readOnly: true,
-        containerPath: '/var/run/docker.sock',
-        sourceVolume: 'dockersock',
-      },
-      {
-        readOnly: false,
-        containerPath: '/letsencrypt',
-        sourceVolume: 'tmp',
-      }
-    );
-    traefikContainer.addPortMappings(
-      {
-        hostPort: 443,
-        protocol: ecs.Protocol.TCP,
-        containerPort: 443,
-      },
-      {
-        hostPort: 8080,
-        protocol: ecs.Protocol.TCP,
-        containerPort: 8080,
-      }
-    );
+
     const service = new ecs.Ec2Service(this, 'MonicaService', {
       cluster: ecsCluster,
       taskDefinition,
