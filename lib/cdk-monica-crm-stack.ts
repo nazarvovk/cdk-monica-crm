@@ -64,6 +64,23 @@ export class CdkMonicaCrmStack extends cdk.Stack {
       'TaskDefinition',
       {}
     );
+    const allowEcsStatement = new iam.PolicyStatement({
+      sid: 'TraefikECSReadAccess',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'ecs:ListClusters',
+        'ecs:DescribeClusters',
+        'ecs:ListTasks',
+        'ecs:DescribeTasks',
+        'ecs:DescribeContainerInstances',
+        'ecs:DescribeTaskDefinition',
+        'ec2:DescribeInstances',
+      ],
+      resources: ['*'],
+    });
+    taskDefinition.addToTaskRolePolicy(allowEcsStatement);
+    taskDefinition.addToExecutionRolePolicy(allowEcsStatement);
+
     taskDefinition.addVolume({
       name: 'dockersock',
       host: {
@@ -118,7 +135,10 @@ export class CdkMonicaCrmStack extends cdk.Stack {
           'traefik.enable': 'true',
           'traefik.http.routers.app.entrypoints': 'app',
           'traefik.http.routers.app.rule': `Host(\`${process.env.DOMAIN_NAME}\`)`,
+          'traefik.http.services.app.loadbalancer.server.port': '80',
           'traefik.http.routers.app.tls.certresolver': 'mytls',
+          'traefik.http.middlewares.redirect.redirectscheme.scheme': 'https',
+          'traefik.http.middlewares.redirect.redirectscheme.permanent': 'true',
         },
       }
     );
@@ -127,6 +147,72 @@ export class CdkMonicaCrmStack extends cdk.Stack {
       protocol: ecs.Protocol.TCP,
       containerPort: 80,
     });
+
+    const traefikContainer = new ecs.ContainerDefinition(
+      this,
+      'traefikContainer',
+      {
+        taskDefinition,
+        image: ecs.ContainerImage.fromRegistry('traefik:v2.3.0-rc2'),
+        memoryReservationMiB: 200,
+        logging: ecs.LogDriver.awsLogs({
+          streamPrefix: 'CDK-TraefikContainer',
+        }),
+        environment: {
+          TRAEFIK_API_INSECURE: 'true',
+          TRAEFIK_API_DASHBOARD: 'true',
+          TRAEFIK_API_DEBUG: 'true',
+          TRAEFIK_LOG_LEVEL: 'DEBUG',
+
+          TRAEFIK_PROVIDERS_ECS: 'true',
+          TRAEFIK_PROVIDERS_ECS_EXPOSEDBYDEFAULT: 'false',
+          TRAEFIK_PROVIDERS_ECS_CLUSTERS: ecsCluster.clusterName,
+          TRAEFIK_PROVIDERS_ECS_REGION: this.region,
+          TRAEFIK_ENTRYPOINTS_APP_ADDRESS: ':443',
+
+          TRAEFIK_CERTIFICATESRESOLVERS_MYTLS_ACME_EMAIL:
+            process.env.SSL_EMAIL || '',
+          TRAEFIK_CERTIFICATESRESOLVERS_MYTLS_ACME_TLSCHALLENGE: 'true',
+          TRAEFIK_CERTIFICATESRSOLVERS_MYTLS_ACME_STORAGE:
+            '/letsencrypt/acme.json',
+        },
+        dockerLabels: {
+          'traefik.enable': 'true',
+          'traefik.http.routers.api.rule': `Host(\`traefik.${process.env.DOMAIN_NAME}\`)`,
+          'traefik.http.routers.api.service': 'api@internal',
+        },
+      }
+    );
+    traefikContainer.addLink(monicaContainer);
+
+    traefikContainer.addContainerDependencies({
+      container: monicaContainer,
+      condition: ecs.ContainerDependencyCondition.START,
+    });
+    traefikContainer.addMountPoints(
+      {
+        readOnly: true,
+        containerPath: '/var/run/docker.sock',
+        sourceVolume: 'dockersock',
+      },
+      {
+        readOnly: false,
+        containerPath: '/letsencrypt',
+        sourceVolume: 'tmp',
+      }
+    );
+    traefikContainer.addPortMappings(
+      {
+        hostPort: 443,
+        protocol: ecs.Protocol.TCP,
+        containerPort: 443,
+      },
+      {
+        hostPort: 8080,
+        protocol: ecs.Protocol.TCP,
+        containerPort: 8080,
+      }
+    );
 
     const service = new ecs.Ec2Service(this, 'MonicaService', {
       cluster: ecsCluster,
